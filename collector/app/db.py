@@ -39,6 +39,9 @@ async def conn() -> aiosqlite.Connection:
         os.makedirs(DATA_DIR, exist_ok=True)
         _conn = await aiosqlite.connect(DB_PATH)
         _conn.row_factory = aiosqlite.Row
+        # WAL：分析端的只读连接与采集写入互不阻塞；忙时最多等待 5s
+        await _conn.execute("PRAGMA journal_mode=WAL")
+        await _conn.execute("PRAGMA busy_timeout=5000")
         await _conn.executescript(SCHEMA)
         await _conn.commit()
     return _conn

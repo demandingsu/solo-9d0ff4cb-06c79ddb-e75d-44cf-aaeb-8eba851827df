@@ -20,5 +20,22 @@ services:
       - portal
     restart: unless-stopped
 
+  analyzer:
+    build: ./analyzer
+    ports:
+      - "8002:8002"
+    environment:
+      # 只读分析库：与采集端同一个 SQLite 文件
+      DB_PATH: /data/collector.db
+      QUERY_TIMEOUT: "2"          # 执行与取数合计上限（秒）
+      MAX_ROWS: "500"             # 单次最多返回行数
+      MAX_CONCURRENCY: "8"        # 并发查询上限，超出快速返回 429
+    volumes:
+      # 容器层只读挂载：分析服务在文件系统层面就无法写入采集库
+      - collector-data:/data:ro
+    depends_on:
+      - collector
+    restart: unless-stopped
+
 volumes:
   collector-data:

@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>过磅数据 · 只读 SQL 分析</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 1180px; margin: 24px auto; padding: 0 16px; background:#f6f7f9; color:#222; }
+  h1 { font-size: 20px; } h2 { font-size: 15px; margin:0 0 8px; }
+  .card { background:#fff; border:1px solid #e3e5e8; border-radius:10px; padding:16px; margin-bottom:16px; }
+  textarea { width:100%; box-sizing:border-box; font-family: ui-monospace, Menlo, Consolas, monospace;
+             font-size:13px; border:1px solid #c9ccd1; border-radius:8px; padding:10px; resize:vertical; }
+  button { padding:8px 18px; border:1px solid #2f6fed; background:#2f6fed; color:#fff; border-radius:7px;
+           cursor:pointer; font-size:14px; }
+  button:hover { background:#2458c4; }
+  button.ghost { background:#fff; color:#2f6fed; }
+  button.danger { background:#fff; color:#b02a37; border-color:#d9707a; padding:5px 12px; font-size:12px; }
+  button.danger:hover { background:#ffebe9; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid #eceef1; white-space:nowrap; }
+  th { color:#666; font-weight:600; background:#fafbfc; position:sticky; top:0; }
+  .wrap { overflow:auto; max-height:520px; border:1px solid #eceef1; border-radius:8px; }
+  .badge { padding:3px 10px; border-radius:999px; font-size:12px; white-space:nowrap; }
+  .run  { background:#fff4d6; color:#9a6700; }
+  .ok   { background:#e3f5e9; color:#1a7f37; }
+  .bad  { background:#ffebe9; color:#cf222e; }
+  .gray { background:#eef0f3; color:#666; }
+  .muted { color:#8a8f98; font-size:12px; }
+  .err { color:#cf222e; font-size:13px; white-space:pre-wrap; }
+  .examples button { font-size:12px; padding:6px 10px; margin:3px 6px 3px 0; background:#f1f4fa;
+                     color:#2458c4; border:1px solid #d3ddf2; border-radius:999px; }
+  .examples button:hover { background:#e2eafa; }
+  code { background:#f1f3f6; padding:1px 6px; border-radius:5px; font-size:12px; }
+  .hist td { font-size:12px; }
+  .hist .sqlcell { font-family:ui-monospace,monospace; max-width:380px; overflow:hidden;
+                   text-overflow:ellipsis; white-space:nowrap; }
+  .trunc { background:#fff8e6; border:1px solid #f0d48a; color:#8a6100; padding:8px 12px;
+           border-radius:8px; font-size:13px; margin-bottom:10px; }
+  .scol { font-size:12px; } .scol b { color:#444; }
+</style>
+</head>
+<body>
+<h1>码头过磅数据 · 只读 SQL 分析</h1>
+
+<div class="card">
+  <div class="muted" style="margin-bottom:10px">
+    仅允许对 <code>jobs</code>、<code>tickets</code> 执行单条只读 <code>SELECT</code>；写入、改表、
+    ATTACH/PRAGMA 及访问其它数据库一律拒绝。查询全程使用同一快照，执行与取数合计
+    <b>≤ 2 秒</b>，最多返回 <b>500 行</b>（超出自动截断并注明）。
+  </div>
+  <textarea id="sql" rows="5" spellcheck="false" placeholder="SELECT ... FROM tickets ..."></textarea>
+  <div style="margin-top:10px; display:flex; gap:10px; align-items:center;">
+    <button id="runBtn" onclick="submit()">提交查询</button>
+    <span id="msg" class="err"></span>
+  </div>
+</div>
+
+<div class="card examples">
+  <h2>示例（点击填入编辑器）</h2>
+  <div id="examples"></div>
+</div>
+
+<div class="card scol" id="schemaCard">
+  <h2>可访问表结构</h2>
+  <div id="schema" class="muted">加载中…</div>
+</div>
+
+<div class="card">
+  <h2>查询历史与状态（按查询号取消）</h2>
+  <table class="hist">
+    <thead><tr><th>查询号</th><th>状态</th><th>SQL</th><th>行数</th><th>耗时</th><th>操作</th></tr></thead>
+    <tbody id="hist"></tbody>
+  </table>
+</div>
+
+<div class="card" id="resultCard" style="display:none">
+  <h2 id="resultTitle">结果</h2>
+  <div id="truncNote" class="trunc" style="display:none"></div>
+  <div id="resultErr" class="err" style="display:none"></div>
+  <div class="wrap" id="resultWrap" style="display:none">
+    <table><thead id="rhead"></thead><tbody id="rbody"></tbody></table>
+  </div>
+</div>
+
+<script>
+const STATES = {
+  running:   {label:'运行中',        cls:'run'},
+  canceling: {label:'取消中…',       cls:'run'},
+  succeeded: {label:'成功',          cls:'ok'},
+  failed:    {label:'已拒绝/出错',   cls:'bad'},
+  canceled:  {label:'已取消',        cls:'gray'},
+  timeout:   {label:'超时已停止',    cls:'bad'},
+};
+
+const EXAMPLES = [
+  {name:'重复过磅（同车牌多单 · 待复核）', sql:
+`SELECT t.plate AS 车牌,
+       COUNT(*) AS 过磅次数,
+       GROUP_CONCAT(t.ticket_no) AS 关联磅单号,
+       ROUND(MIN(t.net_weight),0) AS 最小净重,
+       ROUND(MAX(t.net_weight),0) AS 最大净重,
+       ROUND(AVG(t.net_weight),0) AS 平均净重,
+       j.biz_date AS 业务日期
+FROM tickets t
+JOIN jobs j ON j.id = t.job_id
+WHERE t.voided = 0
+GROUP BY t.plate, j.biz_date
+HAVING COUNT(*) > 1
+ORDER BY 过磅次数 DESC, 车牌
+LIMIT 500`},
+  {name:'净重分布（按区间统计）', sql:
+`SELECT CASE
+         WHEN net_weight < 15000 THEN '01_<15t'
+         WHEN net_weight < 25000 THEN '02_15-25t'
+         WHEN net_weight < 35000 THEN '03_25-35t'
+         WHEN net_weight < 45000 THEN '04_35-45t'
+         ELSE '05_>=45t'
+       END AS 净重区间,
+       COUNT(*) AS 单数,
+       ROUND(AVG(net_weight),0) AS 平均净重
+FROM tickets
+WHERE voided = 0
+GROUP BY 净重区间
+ORDER BY 净重区间`},
+  {name:'跨表核对（任务 × 有效/作废单）', sql:
+`SELECT j.id AS 任务号, j.biz_date AS 日期, j.state AS 采集状态,
+       SUM(CASE WHEN t.voided=0 THEN 1 ELSE 0 END) AS 有效单,
+       SUM(CASE WHEN t.voided=1 THEN 1 ELSE 0 END) AS 作废单,
+       COUNT(t.ticket_no) AS 总单数
+FROM jobs j LEFT JOIN tickets t ON t.job_id = j.id
+GROUP BY j.id ORDER BY j.id`},
+  {name:'耗时查询（递归 300 万行 · 预期 2s 超时）', sql:
+`WITH RECURSIVE cnt(x) AS (
+  SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 3000000
+)
+SELECT count(*) AS 行数, max(x) AS 最大值 FROM cnt`},
+  {name:'写入应被拒绝', sql:
+`UPDATE tickets SET voided = 1 WHERE ticket_no = 'WB00000000-001'`},
+  {name:'访问其它库应被拒绝', sql:
+`ATTACH DATABASE '/tmp/other.db' AS other;
+SELECT * FROM other.secret`},
+];
+
+let currentId = null;
+const $ = id => document.getElementById(id);
+
+function fillExamples() {
+  $('examples').innerHTML = EXAMPLES.map((e, i) =>
+    `<button onclick="useExample(${i})">${e.name}</button>`).join('');
+}
+function useExample(i) {
+  $('sql').value = EXAMPLES[i].sql;
+  $('msg').textContent = '';
+}
+
+async function submit() {
+  const sql = $('sql').value.trim();
+  if (!sql) { $('msg').textContent = '请输入 SQL'; return; }
+  $('msg').textContent = '';
+  $('runBtn').disabled = true;
+  try {
+    const r = await fetch('/api/queries', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({sql})});
+    const j = await r.json();
+    if (!r.ok) {
+      $('msg').textContent = j.detail || ('请求失败 ' + r.status);
+      return;
+    }
+    currentId = j.id;
+  } finally {
+    $('runBtn').disabled = false;
+  }
+  refresh();
+}
+
+async function cancel(id) {
+  await fetch(`/api/queries/${id}/cancel`, {method:'POST'});
+  refresh();
+}
+
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"]/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+async function refresh() {
+  let list = [];
+  try { list = await (await fetch('/api/queries')).json(); } catch(e) { return; }
+  $('hist').innerHTML = list.map(r => {
+    const s = STATES[r.state] || {label:r.state, cls:'gray'};
+    const canCancel = (r.state === 'running' || r.state === 'canceling');
+    return `<tr>
+      <td><a href="#" onclick="view('${r.id}');return false">${r.id}</a></td>
+      <td><span class="badge ${s.cls}">${s.label}</span></td>
+      <td class="sqlcell" title="${esc(r.sql)}">${esc(r.sql)}</td>
+      <td>${r.row_count ?? ''}</td>
+      <td>${r.elapsed_ms != null ? r.elapsed_ms + ' ms' : ''}</td>
+      <td>${canCancel ? `<button class="danger" onclick="cancel('${r.id}')">取消</button>` : ''}</td>
+    </tr>`;
+  }).join('');
+  if (currentId && list.some(r => r.id === currentId)) await view(currentId);
+}
+
+async function view(id) {
+  currentId = id;
+  const r = await fetch('/api/queries/' + id);
+  if (!r.ok) return;
+  const q = await r.json();
+  const s = STATES[q.state] || {label:q.state, cls:'gray'};
+  $('resultCard').style.display = '';
+  $('resultTitle').textContent = `查询 ${q.id} · ${s.label}`;
+  const err = $('resultErr'), wrap = $('resultWrap'), note = $('truncNote');
+  err.style.display = wrap.style.display = note.style.display = 'none';
+
+  if (q.state === 'succeeded') {
+    wrap.style.display = '';
+    $('rhead').innerHTML = '<tr>' + q.columns.map(c => `<th>${esc(c)}</th>`).join('') + '</tr>';
+    $('rbody').innerHTML = q.rows.map(row =>
+      '<tr>' + row.map(v => `<td>${esc(v)}</td>`).join('') + '</tr>').join('');
+    if (q.truncated) {
+      note.style.display = '';
+      note.textContent = `结果已截断：仅显示前 ${q.max_rows} 行（查询在同一快照上执行，耗时 ${q.elapsed_ms} ms，上限 ${q.deadline_seconds} 秒）。`;
+    }
+  } else if (q.state === 'running' || q.state === 'canceling') {
+    err.style.display = '';
+    err.textContent = q.state === 'canceling' ? '正在停止底层运算并释放资源，不返回部分结果…' : '查询运行中…';
+  } else {
+    err.style.display = '';
+    err.textContent = (q.state === 'timeout' ? '⏱ ' : q.state === 'canceled' ? '🚫 ' : '⛔ ') +
+                      (q.error || q.state);
+  }
+}
+
+async function loadSchema() {
+  try {
+    const s = await (await fetch('/api/schema')).json();
+    $('schema').innerHTML = s.map(t =>
+      `<div style="margin-bottom:6px"><b>${t.table}</b>：` +
+      t.columns.map(c => `<code>${c.name} ${c.type}</code>`).join(' · ') + '</div>').join('');
+  } catch (e) {
+    $('schema').textContent = '采集库暂不可用（采集端尚未写入数据），查询接口仍可访问。';
+  }
+}
+
+fillExamples(); loadSchema(); refresh();
+setInterval(refresh, 800);
+</script>
+</body>
+</html>
